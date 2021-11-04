@@ -19,24 +19,67 @@ from pyfuse3 import FUSEError
 from os import fsencode, fsdecode
 from collections import defaultdict
 import trio
-
+import time
+import shutil
 import faulthandler
 faulthandler.enable()
 
 log = logging.getLogger(__name__)
 
 import paramiko
+import sqlite3
+import subprocess
 
 # SFTP接続設定
 sftp_config = {
     'host' : '153.126.189.240',
     'port' : '22',
     'user' : 'redmine_user',
-	'key'  : '/home/yuta/.ssh/redmine.pem'
+	'key'  : '/home/yonde/.ssh/redmine.pem'
 }
 
 CONNECT_PATH = '/home/redmine_user/harada/'
-LOCAL_CACHE_PATH = '/home/yuta/PT-SSHFS/tmp'
+LOCAL_CACHE_PATH = '/home/yonde/pt_sshfs_py/tmp'
+
+class CacheDB:
+    def __init__(self):
+        self.name = "cache.db"
+        self.con = sqlite3.connect(self.name)
+        self.cur = self.con.cursor()
+        self.proc = subprocess.Popen(["python3","cacheman.py"])
+
+    def reset(self):
+        #delete existing table
+        self.cur.execute("DROP TABLE IF EXISTS cache")
+        #create new table
+        self.cur.execute("""CREATE TABLE cache(
+                                    path text,
+                                    dirty integer,
+                                    mtime integer,
+                                    fd integer
+                                )
+                            """)
+        self.con.commit()
+    def register_file(self,path,mtime,fd):
+        if self.check_file(path):
+            self.cur.execute("UPDATE cache SET mtime = ? WHERE path = ?",(mtime,path))
+        else:
+            self.cur.execute("INSERT INTO cache VALUES (?,?,?,?)",(path,1,mtime,fd))
+        self.con.commit()
+    def delete_file(self,path):
+        if self.check_file(path):
+            self.cur.execute("DELETE FROM cache WHERE path = ?",(path,))
+        self.con.commit()
+    def dirty_file(self,path,dirty):
+        self.cur.execute("UPDATE cache SET dirty = ? WHERE path = ?",(dirty,path))
+        self.con.commit()
+    def close_file(self,path):
+        self.cur.execute("UPDATE cache SET fd = ? WHERE path = ?",(0,path))
+        self.con.commit()
+    def check_file(self,path):
+        self.cur.execute("SELECT * FROM cache WHERE path = ?",(path,))
+        return self.cur.fetchone()
+
 
 class Operations(pyfuse3.Operations):
 
@@ -51,6 +94,7 @@ class Operations(pyfuse3.Operations):
         self._fd_open_count = dict()
         self._fd_dirty_map = defaultdict(lambda : 0)
         self.inode_cnt=pyfuse3.ROOT_INODE+1
+        self.cache = CacheDB()
 
     def _inode_to_path(self, inode):
         try:
@@ -78,6 +122,12 @@ class Operations(pyfuse3.Operations):
         elif val != path:
             self._inode_path_map[inode] = { path, val }
 
+    def subpath(self,x,y):
+        if y[-1] == '/':
+            return x[len(y):]
+        else:
+            return x[len(y)+1:]
+
     async def forget(self, inode_list):
         for (inode, nlookup) in inode_list:
             if self._lookup_cnt[inode] > nlookup:
@@ -101,8 +151,8 @@ class Operations(pyfuse3.Operations):
         return attr
 
     async def getattr(self, inode, ctx=None):
-        log.debug('getattr %d',inode)
-        log.debug(self._inode_path_map)
+        #log.debug('getattr %d',inode)
+        #log.debug(self._inode_path_map)
         if inode in self._inode_fd_map:
             return self._getattr(fd=self._inode_fd_map[inode])
         else:
@@ -115,7 +165,8 @@ class Operations(pyfuse3.Operations):
         return None
     
     def sftp_getattr(self,path):
-        xpath=CONNECT_PATH + path[len(self._inode_path_map[pyfuse3.ROOT_INODE])+1:]
+        subpath = self.subpath(path,self._inode_path_map[pyfuse3.ROOT_INODE])
+        xpath=CONNECT_PATH + subpath
         log.debug('sftp_getattr %s',xpath)
         try:
             stat=sftp_connection.lstat(xpath)
@@ -133,7 +184,7 @@ class Operations(pyfuse3.Operations):
         entry.st_atime_ns=stat.st_atime * nano
         entry.st_mtime_ns=stat.st_mtime * nano
         entry.st_ctime_ns=stat.st_mtime * nano
-        log.debug('st_atime_ns %d',stat.st_atime)
+        #log.debug('st_atime_ns %d',stat.st_atime)
         entry.generation = 0
         entry.entry_timeout = 0
         entry.attr_timeout = 0
@@ -181,8 +232,9 @@ class Operations(pyfuse3.Operations):
         return inode
 
     def sftp_readdir(self,path):
-        xpath = CONNECT_PATH + path[len(self._inode_path_map[pyfuse3.ROOT_INODE])+1:]
-        log.debug('sftp_readdir %s',xpath)
+        subpath = self.subpath(path,self._inode_path_map[pyfuse3.ROOT_INODE])
+        xpath = CONNECT_PATH + subpath
+        log.debug('sftp_readdir %s : %s',xpath,self._inode_path_map[pyfuse3.ROOT_INODE])
         try:
             names = sftp_connection.listdir(xpath)
         except:
@@ -191,7 +243,7 @@ class Operations(pyfuse3.Operations):
         
     async def readdir(self, inode, off, token):
         path = self._inode_to_path(inode)
-        log.debug('reading %s', path)
+        #log.debug('reading %s', path)
         entries = []
         #names=os.listdir(path)
         #sftpのreaddirを呼び出し、各ファイル名に対して_getattrを呼ぶ。
@@ -202,7 +254,7 @@ class Operations(pyfuse3.Operations):
             attr = self._getattr(path=os.path.join(path, name))
             entries.append((attr.st_ino, name, attr))
 
-        log.debug('read %d entries, starting at %d', len(entries), off)
+        #log.debug('read %d entries, starting at %d', len(entries), off)
 
         # This is not fully posix compatible. If there are hardlinks
         # (two names with the same inode), we don't have a unique
@@ -407,13 +459,24 @@ class Operations(pyfuse3.Operations):
             self.l_makedir(dir_path)
             os.makedirs(dir_path)
 
+    # なぜかmtimeの更新がされており、二回ダウンロードしてしまう。
     def sftp_openget(self,inode):
         path = self._inode_path_map[inode]
-        xpath = CONNECT_PATH + path[len(self._inode_path_map[pyfuse3.ROOT_INODE])+1:]
+        stat = self._getattr(path)
+        cfi = self.cache.check_file(path)
+        if cfi:
+            log.warning("open %s time: %d <-> %d",path,cfi[2],stat.st_mtime_ns)
+            if cfi[2] >= stat.st_mtime_ns:
+                return
+        subpath = self.subpath(path,self._inode_path_map[pyfuse3.ROOT_INODE])
+        xpath = CONNECT_PATH + subpath
         log.debug('sftp_openget remote:%s local:%s',xpath,path)
         #再帰的にディレクトリを作成
         self.l_makedir(path)
-        sftp_connection.get(xpath,path)
+        sftp_connection.get(xpath,path) 
+        log.warning("download finish %s",path)
+        self.cache.register_file(path,time.time_ns(),1)
+        return
 
     async def open(self, inode, flags, ctx):
         log.debug('open')
@@ -453,6 +516,8 @@ class Operations(pyfuse3.Operations):
     async def write(self, fd, offset, buf):
         os.lseek(fd, offset, os.SEEK_SET)
         self._fd_dirty_map[fd]+=1
+        path=self._inode_path_map[self._fd_inode_map[fd]]
+        self.cache.dirty_file(path,1)
         return os.write(fd, buf)
     
     # def r_makedir(self,path):
@@ -461,29 +526,30 @@ class Operations(pyfuse3.Operations):
     #         self._makedir(dir_path)
     #         os.makedirs(dir_path)
 
-    def sftp_closeput(self,fd):
-        log.debug('sftp_close for %d', fd)
-        inode = self._fd_inode_map[fd]
-        path = self._inode_path_map[inode]
-        xpath = CONNECT_PATH + path[len(self._inode_path_map[pyfuse3.ROOT_INODE])+1:]
-        log.debug('sftp_closeput remote:%s local:%s',xpath,path)
-        #self.r_makedir(path)
-        sftp_connection.put(path,xpath)
-        self._fd_dirty_map[fd]=0
+    def sftp_closeput(self,path):
+        self.cache.close_file(path)
+        if self.cache.check_file(path)[1]:
+            subpath = self.subpath(path,self._inode_path_map[pyfuse3.ROOT_INODE])
+            xpath = CONNECT_PATH + subpath
+            log.debug('sftp_closeput remote:%s local:%s',xpath,path)
+            #self.r_makedir(path)
+            sftp_connection.put(path,xpath)
+            self.cache.dirty_file(path,0)
 
     async def release(self, fd):
-        log.debug('release for %d', fd)
         if self._fd_open_count[fd] > 1:
             self._fd_open_count[fd] -= 1
             return
-        if self._fd_dirty_map[fd]>0:
-            self.sftp_closeput(fd)
+        inode = self._fd_inode_map[fd]
+        path = self._inode_path_map[inode]
+        log.warning('release for %s', path)
         del self._fd_open_count[fd]
         inode = self._fd_inode_map[fd]
         del self._inode_fd_map[inode]
         del self._fd_inode_map[fd]
         try:
             os.close(fd)
+            self.sftp_closeput(path)
         except OSError as exc:
             raise FUSEError(exc.errno)
 
@@ -522,6 +588,10 @@ def main():
     options = parse_args(sys.argv[1:])
     init_logging(options.debug)
     operations = Operations(options.source)
+    operations.cache.reset()
+
+    shutil.rmtree(options.source)
+    os.makedirs(options.source)
 
     log.debug('Mounting...')
     fuse_options = set(pyfuse3.default_options)

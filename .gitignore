@@ -1,2 +1,4 @@
-cache.d/
-tmp/
+cache.d/*
+tmp/*
+task
+*.db
